@@ -14,6 +14,9 @@ import requests
 import urllib.request, urllib.parse, urllib.error
 import urllib.parse
 import uuid
+from io import BytesIO
+from PIL import Image
+from premailer import transform
 from xml.etree import cElementTree as ET
 
 from django.apps import apps
@@ -352,3 +355,94 @@ def netloc_to_domain(netloc):
     # Port specified in URL
     domain = domain.split(':')[0]
     return domain
+
+def open_mail_in_browser(html):
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    path = tmp.name + ".html"
+    f = open(path, "w")
+    f.write(html)
+    f.close()
+    webbrowser.open("file://" + path)
+
+
+class EmailMessageMaker:
+
+    @staticmethod
+    def create_student_badge_request_email(user, badge_class):
+        template = 'email/requested_badge.html'
+        email_vars = {'public_badge_url': badge_class.public_url,
+                      'badge_name': badge_class.name,
+                      'user_name': user.get_full_name()}
+        return render_to_string(template, email_vars)
+
+    @staticmethod
+    def create_staff_member_addition_email(new_staff_membership):
+        template = 'email/new_role.html'
+        entity = new_staff_membership.object
+        entity_type = entity.__class__.__name__.lower()
+        determiner = 'an' if entity_type[0] in 'aeiou' else 'a'
+        email_vars = {'staff_page_url': new_staff_membership.staff_page_url,
+                      'entity_type': entity_type,
+                      'entity_name': entity.name,
+                      'determiner': determiner}
+        return render_to_string(template, email_vars)
+
+    @staticmethod
+    def create_earned_badge_mail(assertion):
+        badgeclass = assertion.badgeclass
+        template = 'email/earned_badge.html'
+        background = Image.open(badgeclass.image.path).convert("RGBA")
+        overlay = Image.open(finders.find('images/example_overlay.png')).convert("RGBA")
+        if overlay.width != background.width:
+            width_ratio = background.width/overlay.width
+            new_background_height = background.height*width_ratio
+            new_background_size = (overlay.width, new_background_height)
+            background.thumbnail((new_background_size), Image.ANTIALIAS)
+        position = (0, background.height//4)
+        background.paste(overlay, position, overlay)
+        buffered = BytesIO()
+        background.save(buffered, format="PNG")
+        encoded_string = base64.b64encode(buffered.getvalue()).decode()
+        email_vars = {
+            'badgeclass_image': 'data:image/png;base64,{}'.format(encoded_string),
+            'issuer_image': badgeclass.issuer.image_url(),
+            'issuer_name': badgeclass.issuer.name,
+            'faculty_name': badgeclass.issuer.faculty.name,
+            'assertion_url': assertion.student_url,
+            'badgeclass_description': badgeclass.description,
+            'badgeclass_name': badgeclass.name,
+        }
+        return render_to_string(template, email_vars)
+
+
+def send_mail(subject, message, from_email, recipient_list, html_message=None, **kwargs):
+    if html_message:
+        html_with_inline_css = transform(html_message)
+        msg = mail.EmailMessage(subject=subject, body=html_with_inline_css, from_email=from_email, to=recipient_list)
+        msg.content_subtype = "html"
+        msg.send()
+    else:
+        mail.send_mail(subject, message, from_email, recipient_list, html_message=html_message, **kwargs)
+
+
+def admin_list_linkify(field_name, label_param=None):
+    """
+    Converts a foreign key value into clickable links for the admin list view.
+
+    field_name is the column name of the foreignkey
+    label_param is the param you want to show in the list as label of the referenced object
+    """
+    def _linkify(obj):
+        linked_obj = getattr(obj, field_name)
+        if linked_obj is None:
+            return '-'
+        app_label = linked_obj._meta.app_label
+        model_name = linked_obj._meta.model_name
+        view_name = f'admin:{app_label}_{model_name}_change'
+        link_url = reverse(view_name, args=[linked_obj.pk])
+        if label_param:
+            linked_obj = getattr(linked_obj, label_param)
+        return format_html('<a href="{}">{}</a>', link_url, linked_obj)
+
+    _linkify.short_description = field_name  # Sets column name
+    return _linkify

@@ -1,5 +1,6 @@
 import os
 import sys
+import django
 
 # assume we(this file) have a parent that is a sibling to the CODE_DIR
 OUR_DIR = os.path.abspath(os.path.dirname(__file__))

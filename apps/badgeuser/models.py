@@ -1,38 +1,174 @@
-
-
 import base64
+import datetime
 import re
 from itertools import chain
+from jsonfield import JSONField
 
 import cachemodel
-import datetime
 from allauth.account.models import EmailAddress, EmailConfirmation
-from basic_models.models import IsActive
-from django.core.cache import cache
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.core.validators import URLValidator, RegexValidator
 from django.db import models, transaction
+from django.utils import timezone
+from django.utils.html import strip_tags
 from django.utils.translation import ugettext_lazy as _
-from oauth2_provider.models import Application
+from oauth2_provider.models import AccessToken, Application
+from oauthlib.common import generate_token
 from rest_framework.authtoken.models import Token
 
+from badgeuser.managers import CachedEmailAddressManager, BadgeUserManager, EmailAddressCacheModelManager
 from backpack.models import BackpackCollection
 from badgeuser.tasks import process_post_recipient_id_deletion, process_post_recipient_id_verification_change
 from entity.models import BaseVersionedEntity
-from issuer.models import Issuer, BadgeInstance, BaseAuditedModel, BaseAuditedModelDeletedWithUser
-from badgeuser.managers import CachedEmailAddressManager, BadgeUserManager
+from issuer.models import BadgeInstance
+from lti_edu.models import StudentsEnrolled
+from mainsite.exceptions import BadgrApiException400, BadgrValidationError
+from mainsite.models import ApplicationInfo, EmailBlacklist, BaseAuditedModel, BadgrApp
+from mainsite.utils import open_mail_in_browser, send_mail
+from signing.models import AssertionTimeStamp
 from badgeuser.utils import generate_badgr_username
-from mainsite.models import ApplicationInfo
+from staff.models import InstitutionStaff, FacultyStaff, IssuerStaff, BadgeClassStaff
 
+
+class UserProvisionment(BaseAuditedModel, BaseVersionedEntity, cachemodel.CacheModel):
+    user = models.ForeignKey('badgeuser.BadgeUser', null=True, on_delete=models.CASCADE)
+    email = models.EmailField()
+    content_type = models.ForeignKey(ContentType, null=True, on_delete=models.CASCADE)
+    object_id = models.PositiveIntegerField(null=True)  # id of the related object the invitation was for
+    entity = GenericForeignKey('content_type', 'object_id')
+    data = JSONField(null=True)
+    for_teacher = models.BooleanField()
+    rejected = models.BooleanField(default=False)
+    TYPE_INVITATION = 'Invitation'  # invitation to the application
+    TYPE_FIRST_ADMIN_INVITATION = 'FirstAdminInvitation'  # invitation to the application
+    TYPE_CHOICES = (
+        (TYPE_INVITATION, 'Invitation'),
+        (TYPE_FIRST_ADMIN_INVITATION, 'FirstAdminInvitation'),
+    )
+    type = models.CharField(max_length=254, choices=TYPE_CHOICES)
+    notes = models.TextField(blank=True, null=True, default=None)
+
+    def _validate_unique(self, exclude=None):
+        """Custom uniqueness validation of the provisionment, used before save"""
+        if UserProvisionment.objects.filter(
+                type=self.type,
+                rejected=False,
+                for_teacher=self.for_teacher,
+                email=self.email).exclude(pk=self.pk).exists():
+            raise BadgrValidationError('There may be only one invite per email address.', 501)
+        return super(UserProvisionment, self).validate_unique(exclude=exclude)
+
+    def _validate_staff_collision(self):
+        """validate to see if there is a existing staff membership that conflicts for the entity of this invite"""
+        if self.user and self.entity.get_all_staff_memberships_in_current_branch(self.user):
+            raise BadgrValidationError('Cannot invite user for this entity. There is a conflicting staff membership.', 502)
+
+    def _validate_invite_collision(self):
+        """validate to see if the there is another invite that collides with this one
+         (i.e. if both are created the staff memberships will collide"""
+        all_entities_in_same_branch = self.entity.get_all_entities_in_branch()
+        all_invites_for_same_user = UserProvisionment.objects.filter(email=self.email)
+        for invite in all_invites_for_same_user:
+            if invite != self and invite.entity in all_entities_in_same_branch:
+                raise BadgrValidationError('Cannot invite user for this entity. There is a conflicting invite.', 503)
+
+    def get_permissions(self, user):
+        return self.entity.get_permissions(user)
+
+    def match_user(self, user):
+        '''Sets given user as the matched user'''
+        try:
+            entity_institution = self.entity.institution
+        except AttributeError:
+            entity_institution = self.entity
+        if user.institution != entity_institution:
+            raise BadgrValidationError('May not invite user from other institution', 504)
+        if user.is_teacher and not self.for_teacher:
+            raise BadgrValidationError('This invite is for a student', 505)
+        if not user.is_teacher and self.for_teacher:
+            raise BadgrValidationError('This invite is for a teacher', 506)
+        self.user = user
+        self.save()
+
+    def find_and_match_user(self):
+        """Finds a user with the same emailadress and sets it as the matched user"""
+        try:
+            user = BadgeUser.objects.get(email=self.email, is_teacher=self.for_teacher)
+            self.match_user(user)
+        except BadgeUser.DoesNotExist:
+            pass
+
+
+    def add_entity(self, entity):
+        self.content_type = ContentType.objects.get_for_model(entity)
+        self.object_id = entity.pk
+        self.save()
+
+    # @property
+    # def acceptance_link(self):
+    #     return OriginSetting.HTTP + reverse('user_provision_accept', kwargs={'entity_id': self.entity_id})
+
+    def send_email(self):
+        """Send the invitation email to the recipient"""
+        try:
+            EmailBlacklist.objects.get(email=self.email)
+        except EmailBlacklist.DoesNotExist:
+            subject = 'You have been invited'
+            login_link = BadgrApp.objects.get(pk=1).email_confirmation_redirect
+            if self.user:
+                message = "You have been invited for a staff membership. Please login to accept. \n {}".format(login_link)
+            if not self.user:
+                message = "You have been invited to the EduBadges Issuer Platform. Please signup to accept. \n {}".format(login_link)
+                send_mail(subject, message, None, [self.email])
+
+    def perform_provisioning(self):
+        '''Actually create the objects that form the provisionment'''
+        permissions = self.data
+        prov = self.entity.create_staff_membership(self.user, permissions)
+        self.delete()
+        return prov
+
+    def accept(self):
+        """Accept the provsionment"""
+        return self.perform_provisioning()
+
+    def reject(self):
+        """reject the provisionment"""
+        self.rejected = True
+        self.save()
+
+    def _run_validations(self):
+        if self.type == UserProvisionment.TYPE_FIRST_ADMIN_INVITATION:
+            self._validate_unique()
+        else:
+            self._validate_staff_collision()
+            self._validate_invite_collision()
+
+    def _remove_cache(self):
+        if self.entity:
+            self.entity.remove_cached_data(['cached_userprovisionments'])
+
+    def save(self, *args, **kwargs):
+        self._run_validations()
+        self._remove_cache()
+        return super(UserProvisionment, self).save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        self._remove_cache()
+        return super(UserProvisionment, self).delete(*args, **kwargs)
 
 AUTH_USER_MODEL = getattr(settings, 'AUTH_USER_MODEL', 'auth.User')
 
 
 class CachedEmailAddress(EmailAddress, cachemodel.CacheModel):
     objects = CachedEmailAddressManager()
+    cached = EmailAddressCacheModelManager()
 
     class Meta:
         proxy = True
@@ -88,7 +224,7 @@ class CachedEmailAddress(EmailAddress, cachemodel.CacheModel):
         if not self.emailaddressvariant_set.exists() and self.email != self.email.lower():
             self.add_variant(self.email.lower())
 
-    @cachemodel.cached_method(auto_publish=True)
+#     @cachemodel.cached_method(auto_publish=True) # no caching due to errors in update_user_params
     def cached_variants(self):
         return self.emailaddressvariant_set.all()
 
@@ -125,7 +261,7 @@ class EmailAddressVariant(models.Model):
         super(EmailAddressVariant, self).save(*args, **kwargs)
         self.canonical_email.save()
 
-    def __str__(self):
+    def __unicode__(self):
         return self.email
 
     @property
@@ -151,6 +287,168 @@ class EmailAddressVariant(models.Model):
 
         return True
 
+
+class UserCachedObjectGetterMixin(object):
+    """
+    Base class to group all cached object-getter functionality of user, purely for readability
+    """
+    def _get_objects_with_permissions(self, permissions, type=None):
+        """
+        :param permission: list of strings representing permissions
+        :param type: string that represent class.__name__ ('Institution', 'Faculty', 'Issuer', 'BadgeClass' or None)
+        :return: list of objects for which this user has the given permissions for.
+        """
+        permissioned_objects = []
+
+        def object_tree_walker(obj, permissions, looking_for=type, override_permissions=False):
+            """
+            Recursively walks the object tree to find objects of which the user has all the given permissions for.
+            """
+            if obj.check_local_permissions(self, permissions) or override_permissions:
+                if looking_for:
+                    if obj.__class__.__name__ == looking_for:
+                        permissioned_objects.append(obj)
+                else:
+                    permissioned_objects.append(obj)
+                override_permissions = True
+            try:
+                for child in obj.children:
+                    object_tree_walker(child, permissions, looking_for, override_permissions)
+            except AttributeError:  # no more kids
+                pass
+        if not self.is_teacher:
+            raise ValueError('User must be teacher to walk the permission tree')
+        tree_root = self.institution
+        object_tree_walker(tree_root, permissions)
+        return permissioned_objects
+
+    def get_all_objects_with_permissions(self, permissions):
+        return self._get_objects_with_permissions(permissions)
+
+    def get_all_badgeclasses_with_permissions(self, permissions):
+        return self._get_objects_with_permissions(permissions, 'BadgeClass')
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_badgeinstances(self):
+        return BadgeInstance.objects.filter(user=self)
+
+    @cachemodel.cached_method()
+    def cached_pending_enrollments(self):
+        return StudentsEnrolled.objects.filter(user=self, badge_instance=None)
+
+    # @cachemodel.cached_method(auto_publish=True)
+    # turned it off, because if user logs in for FIRST time, this caching will result in the user having no verified emails.
+    # This results in api calls responding with a 403 after the failure of the AuthenticatedWithVerifiedEmail permission check.
+    # Which will logout the user automatically with the error: Token expired.
+    def cached_emails(self):
+        return CachedEmailAddress.objects.filter(user=self)
+
+    def cached_email_variants(self):
+        return chain.from_iterable(email.cached_variants() for email in self.cached_emails())
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_token(self):
+        user_token, created = \
+                Token.objects.get_or_create(user=self)
+        return user_token.key
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_terms_agreements(self):
+        return list(self.termsagreement_set.all())
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_institution_staff(self):
+        try:
+            return InstitutionStaff.objects.get(user=self)
+        except InstitutionStaff.DoesNotExist:
+            return None
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_faculty_staffs(self):
+        return list(FacultyStaff.objects.filter(user=self))
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_issuer_staffs(self):
+        return list(IssuerStaff.objects.filter(user=self))
+
+    @cachemodel.cached_method(auto_publish=True)
+    def cached_badgeclass_staffs(self):
+        return list(BadgeClassStaff.objects.filter(user=self))
+
+    @cachemodel.cached_method()
+    def cached_colleagues(self):
+        return list(BadgeUser.objects.filter(institution=self.institution))
+
+
+class UserPermissionsMixin(object):
+    """
+    Base class to group all permission functionality of user, purely for readability
+    """
+    def is_user_within_scope(self, user):
+        """
+        See if user has other user in his scope, (i.e. is other user found in your institution)
+        This is used when creating a new staff membership object, then this user must be in your scope.
+        """
+        if self == user:
+            return False  # cannot administrate yourself
+        return self.institution == user.institution
+
+    def is_staff_membership_within_scope(self, staff_membership):
+        """
+        See if staff membership is in this user's scope. This is used when editing or removing staff membership objects.
+        """
+        all_administrable_objects = self.get_all_objects_with_permissions(['may_administrate_users'])
+        for obj in all_administrable_objects:
+            for staff in obj.staff_items:
+                if staff == staff_membership:
+                    return True  # staff membership is administrable
+        return False
+
+    def get_permissions(self, obj):
+        """
+        Convenience method to get permissions for this user & object combination
+        :param obj: Instance of Institution, Faculty, Issuer or Badgeclass
+        :return: dictionary
+        """
+        return obj.get_permissions(self)
+
+    @property
+    def may_sign_assertion(self, badgeinstance):
+        """
+        Method to check if user may sign the assertion
+        """
+        perms = badgeinstance.badgeclass.get_permissions(self)
+        return perms['may_sign']
+
+    def may_enroll(self, badge_class, raise_exception=False):
+        """
+        Checks to see if user may enroll
+            no enrollments: May enroll
+            any not awarded assertions: May not enroll
+            Any awarded and not revoked: May not enroll
+            All revoked: May enroll
+        """
+        social_account = self.get_social_account()
+        if social_account.provider == 'edu_id':
+            enrollments = StudentsEnrolled.objects.filter(user=social_account.user, badge_class_id=badge_class.pk)
+            if not enrollments:
+                return True  # no enrollments
+            else:
+                for enrollment in enrollments:
+                    if not bool(enrollment.badge_instance):  # has never been awarded
+                        if raise_exception:
+                            raise BadgrApiException400('May not enroll: already enrolled', 201)
+                        return False
+                    else:  # has been awarded
+                        if not enrollment.assertion_is_revoked():
+                            if raise_exception:
+                                raise BadgrApiException400('May not enroll: you already have been awarded this badge', 202)
+                            return False
+                return True  # all have been awarded and revoked
+        else:  # no eduID
+            if raise_exception:
+                raise BadgrApiException400("May not enroll: you don't have a student account", 203)
+            return False
 
 class UserRecipientIdentifier(cachemodel.CacheModel):
     """
@@ -213,72 +511,47 @@ class UserRecipientIdentifier(cachemodel.CacheModel):
         process_post_recipient_id_deletion.delay(self.identifier)
 
 
-class BadgeUser(BaseVersionedEntity, AbstractUser, cachemodel.CacheModel):
+class BadgeUser(UserCachedObjectGetterMixin, UserPermissionsMixin, AbstractUser, BaseVersionedEntity):
     """
     A full-featured user model that can be an Earner, Issuer, or Consumer of Open Badges
     """
     entity_class_name = 'BadgeUser'
+    is_teacher = models.BooleanField(default=False)
+    invited = models.BooleanField(default=False)
 
-    USERNAME_FIELD = 'username'
-    REQUIRED_FIELDS = ['email']
+    # Override from AbstractUser
+    first_name = models.CharField(_('first name'), max_length=254, blank=True)
+    last_name = models.CharField(_('last name'), max_length=254, blank=True)
 
-    badgrapp = models.ForeignKey('mainsite.BadgrApp', blank=True, null=True, default=None, on_delete=models.SET_NULL)
+    badgrapp = models.ForeignKey('mainsite.BadgrApp', on_delete=models.SET_NULL, blank=True, null=True, default=None)
+    is_staff = models.BooleanField(
+        _('Backend-staff member'),
+        default=False,
+        help_text=_('Designates whether the user can log into this admin site.'),
+    )
 
+    # canvas LTI id
+    lti_id = models.CharField(unique=True, max_length=50, default=None, null=True, blank=True,
+                              help_text='LTI user id, unique per user')
     marketing_opt_in = models.BooleanField(default=False)
 
     objects = BadgeUserManager()
+
+    institution = models.ForeignKey('institution.Institution', on_delete=models.CASCADE, null=True)
 
     class Meta:
         verbose_name = _('badge user')
         verbose_name_plural = _('badge users')
         db_table = 'users'
+        permissions=(('view_issuer_tab', 'User can view Issuer tab in front end'),
+                     ('view_management_tab', 'User can view Management dashboard'),
+                     ('has_faculty_scope', 'User has faculty scope'),
+                     ('has_institution_scope', 'User has institution scope'),
+                     ('ui_issuer_add', 'User can add issuer in front end'),
+                     )
 
-    def __str__(self):
-        primary_identifier = self.email or next((e for e in self.all_verified_recipient_identifiers), '')
-        return "{} ({})".format(self.get_full_name(), primary_identifier)
-
-    def get_full_name(self):
-        return "%s %s" % (self.first_name, self.last_name)
-
-    def email_user(self, subject, message, from_email=None, **kwargs):
-        """
-        Sends an email to this User.
-        """
-        send_mail(subject, message, from_email, [self.primary_email], **kwargs)
-
-    def publish(self):
-        super(BadgeUser, self).publish()
-        self.publish_by('username')
-
-    def delete(self, *args, **kwargs):
-        cached_emails = self.cached_emails()
-        if cached_emails.exists():
-            for email in cached_emails:
-                email.delete()
-        super(BadgeUser, self).delete(*args, **kwargs)
-        self.publish_delete('username')
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_verified_urls(self):
-        return [
-            r.identifier for r in
-            self.userrecipientidentifier_set.filter(
-                verified=True, type=UserRecipientIdentifier.IDENTIFIER_TYPE_URL)]
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_verified_phone_numbers(self):
-        return [
-            r.identifier for r in
-            self.userrecipientidentifier_set.filter(
-                verified=True, type=UserRecipientIdentifier.IDENTIFIER_TYPE_TELEPHONE)]
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_emails(self):
-        return CachedEmailAddress.objects.filter(user=self)
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_backpackcollections(self):
-        return BackpackCollection.objects.filter(created_by=self)
+    def __unicode__(self):
+        return "{} <{}>".format(self.get_full_name(), self.email)
 
     @property
     def email_items(self):
@@ -291,9 +564,6 @@ class BadgeUser(BaseVersionedEntity, AbstractUser, cachemodel.CacheModel):
         :param value: list(BadgeUserEmailSerializerV2)
         :return: None
         """
-        return self.set_email_items(value)
-
-    def set_email_items(self, value, send_confirmations=True, allow_verify=False):
         if len(value) < 1:
             raise ValidationError("Must have at least 1 email")
 
@@ -302,74 +572,106 @@ class BadgeUser(BaseVersionedEntity, AbstractUser, cachemodel.CacheModel):
         primary_count = sum(1 if d.get('primary', False) else 0 for d in value)
         if primary_count != 1:
             raise ValidationError("Must have exactly 1 primary email")
-        requested_primary = [d for d in value if d.get('primary', False)][0]
 
         with transaction.atomic():
             # add or update existing items
             for email_data in value:
                 primary = email_data.get('primary', False)
-                verified = email_data.get('verified', False)
                 emailaddress, created = CachedEmailAddress.cached.get_or_create(
                     email=email_data['email'],
                     defaults={
                         'user': self,
                         'primary': primary
                     })
-                if not created:
-                    dirty = False
-
+                if created:
+                    # new email address send a confirmation
+                    emailaddress.send_confirmation()
+                else:
                     if emailaddress.user_id == self.id:
                         # existing email address owned by user
                         emailaddress.primary = primary
-                        dirty = True
+                        emailaddress.save()
                     elif not emailaddress.verified:
                         # existing unverified email address, handover to this user
                         emailaddress.user = self
                         emailaddress.primary = primary
-                        emailaddress.save()  # in this case, don't mark as dirty
+                        emailaddress.save()
                         emailaddress.send_confirmation()
                     else:
                         # existing email address used by someone else
                         raise ValidationError("Email '{}' may already be in use".format(email_data.get('email')))
 
-                    if allow_verify and verified != emailaddress.verified:
-                        emailaddress.verified = verified
-                        dirty = True
-
-                    if dirty:
-                        emailaddress.save()
-                else:
-                    # email is new
-                    if allow_verify and email_data.get('verified') is True:
-                        emailaddress.verified = True
-                        emailaddress.save()
-                    if emailaddress.verified is False and created is True and send_confirmations is True:
-                        # new email address send a confirmation
-                        emailaddress.send_confirmation()
-
-                if not emailaddress.verified:
-                    continue  # only verified email addresses may have variants. Don't bother trying otherwise.
-
-                requested_variants = email_data.get('cached_variant_emails', [])
-                existing_variant_emails = emailaddress.cached_variant_emails()
-                for requested_variant in requested_variants:
-                    if requested_variant not in existing_variant_emails:
-                        EmailAddressVariant.objects.create(
-                            canonical_email=emailaddress, email=requested_variant
-                        )
-
             # remove old items
             for emailaddress in self.email_items:
-                if emailaddress.email.lower() not in (lower_case_idx.lower() for lower_case_idx in new_email_idx):
+                if emailaddress.email not in new_email_idx:
                     emailaddress.delete()
 
-        if self.email != requested_primary:
-            self.email = requested_primary['email']
-            self.save()
+    @property
+    def current_symmetric_key(self):
+        return self.symmetrickey_set.get(current=True)
 
+    def accept_terms(self, terms):
+        agreement, _ = TermsAgreement.objects.get_or_create(user=self, terms=terms)
+        agreement.agreed_version = terms.version
+        agreement.agreed = True
+        agreement.save()
 
-    def cached_email_variants(self):
-        return chain.from_iterable(email.cached_variants() for email in self.cached_emails())
+    def accept_general_terms(self):
+        general_terms = Terms.get_general_terms(self)
+        for terms in general_terms:
+            self.accept_terms(terms)
+        self.remove_cached_data(['cached_terms_agreements'])
+
+    def general_terms_accepted(self):
+        nr_accepted = 0
+        general_terms = Terms.get_general_terms(self)
+        for general_term in general_terms:
+            if general_term.has_been_accepted_by(self):
+                nr_accepted += 1
+        return general_terms.__len__() == nr_accepted
+
+    @property
+    def full_name(self):
+        return self.get_full_name()
+
+    def get_full_name(self):
+        if self.first_name and self.last_name:
+            return "%s %s" % (self.first_name, self.last_name)
+        else:
+            return ''
+
+    def match_provisionments(self):
+        """Used to match provisions on initial login"""
+        provisions = UserProvisionment.objects.filter(email=self.email, for_teacher=self.is_teacher)
+        for provision in provisions:
+            provision.match_user(self)
+        return provisions
+
+    def email_user(self, subject, html_message=None, from_email=None, **kwargs):
+        """
+        Sends an email to this User.
+        """
+        try:
+            EmailBlacklist.objects.get(email=self.primary_email)
+        except EmailBlacklist.DoesNotExist:
+            # Allow sending, as this email is not blacklisted.
+            if settings.LOCAL_DEVELOPMENT_MODE:
+                open_mail_in_browser(html_message)
+            else:
+                plain_text = strip_tags(html_message)
+                send_mail(subject, message=plain_text, from_email=from_email,
+                          html_message=html_message, recipient_list=[self.primary_email], **kwargs)
+        else:
+            return
+            # TODO: Report email non-delivery somewhere.
+
+    def publish(self):
+        super(BadgeUser, self).publish()
+        self.publish_by('username')
+
+    def delete(self, *args, **kwargs):
+        super(BadgeUser, self).delete(*args, **kwargs)
+        cache.clear()
 
     def can_add_variant(self, email):
         try:
@@ -399,93 +701,54 @@ class BadgeUser(BaseVersionedEntity, AbstractUser, cachemodel.CacheModel):
         if self.is_superuser:
             return True
 
-        if len(self.all_verified_recipient_identifiers) > 0:
+        if len(self.verified_emails) > 0:
             return True
 
         return False
 
     @property
     def all_recipient_identifiers(self):
-        return [e.email for e in self.cached_emails()] + \
-            [e.email for e in self.cached_email_variants()] + \
-            self.cached_verified_urls() + \
-            self.cached_verified_phone_numbers()
+        return [self.get_recipient_identifier()]
+
+    def get_eduperson_scoped_affiliations(self):
+        social_account = self.get_social_account()
+        return social_account.extra_data['eduperson_scoped_affiliation']
+
+    def get_all_associated_institutions_identifiers(self):
+        '''returns self.institution and all institutions in the social account '''
+        if self.is_teacher:
+            return [self.institution.identifier]
+        else:
+            affiliations = []
+            for affiliation in self.get_eduperson_scoped_affiliations():
+                domain = affiliation.split("@", 1)[-1]
+                parts = domain.split(".")[-2:]
+                affiliations.append(".".join(parts[-2:]))
+            return affiliations
+
+    def get_recipient_identifier(self):
+        from allauth.socialaccount.models import SocialAccount
+        try:
+            account = SocialAccount.objects.get(user=self.pk)
+            return account.uid
+        except SocialAccount.DoesNotExist:
+            return None
+
+    def get_social_account(self):
+        from allauth.socialaccount.models import SocialAccount
+        try:
+            account = SocialAccount.objects.get(user=self.pk)
+            return account
+        except SocialAccount.DoesNotExist:
+            return None
 
     @property
-    def all_verified_recipient_identifiers(self):
-        return ([e.email for e in self.cached_emails() if e.verified]
-                + [e.email for e in self.cached_email_variants()]
-                + self.cached_verified_urls()
-                + self.cached_verified_phone_numbers())
+    def is_student(self):
+        return not self.is_teacher
 
-    def is_email_verified(self, email):
-        if email in self.all_verified_recipient_identifiers:
-            return True
-
-        try:
-            app_infos = ApplicationInfo.objects.filter(application__user=self)
-            if any(app_info.trust_email_verification for app_info in app_infos):
-                return True
-        except ApplicationInfo.DoesNotExist:
-            return False
-
-        return False
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_issuers(self):
-        return Issuer.objects.filter(staff__id=self.id).distinct()
-
-    @property
-    def peers(self):
-        """
-        a BadgeUser is a Peer of another BadgeUser if they appear in an IssuerStaff together
-        """
-        return set(chain(*[[s.cached_user for s in i.cached_issuerstaff()] for i in self.cached_issuers()]))
-
-    def cached_badgeclasses(self):
-        return chain.from_iterable(issuer.cached_badgeclasses() for issuer in self.cached_issuers())
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_badgeinstances(self):
-        return BadgeInstance.objects.filter(recipient_identifier__in=self.all_recipient_identifiers)
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_externaltools(self):
-        return [a.cached_externaltool for a in self.externaltooluseractivation_set.filter(is_active=True)]
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_token(self):
-        user_token, created = \
-                Token.objects.get_or_create(user=self)
-        return user_token.key
-
-    @cachemodel.cached_method(auto_publish=True)
-    def cached_agreed_terms_version(self):
-        try:
-            return self.termsagreement_set.all().order_by('-terms_version')[0]
-        except IndexError:
-            pass
-        return None
-
-    @property
-    def agreed_terms_version(self):
-        v = self.cached_agreed_terms_version()
-        if v is None:
-            return 0
-        return v.terms_version
-
-    @agreed_terms_version.setter
-    def agreed_terms_version(self, value):
-        try:
-            value = int(value)
-        except ValueError as e:
-            return
-
-        if value > self.agreed_terms_version:
-            if TermsVersion.active_objects.filter(version=value).exists():
-                if not self.pk:
-                    self.save()
-                self.termsagreement_set.get_or_create(terms_version=value, defaults=dict(agreed=True))
+    def get_assertions_ready_for_signing(self):
+        assertion_timestamps = AssertionTimeStamp.objects.filter(signer=self).exclude(proof='')
+        return [ts.badge_instance for ts in assertion_timestamps if ts.badge_instance.signature == None]
 
     def replace_token(self):
         Token.objects.filter(user=self).delete()
@@ -508,50 +771,155 @@ class BadgeUser(BaseVersionedEntity, AbstractUser, cachemodel.CacheModel):
         return super(BadgeUser, self).save(*args, **kwargs)
 
 
-class TermsVersionManager(cachemodel.CacheModelManager):
-    latest_version_key = "badgr_server_cached_latest_version"
+class BadgrAccessTokenManager(models.Manager):
 
-    def latest_version(self):
-        latest = self.cached_latest()
-        if latest is not None:
-            return latest.version
-        return 0
+    def generate_new_token_for_user(self, user, scope='r:profile', application=None, expires=None, refresh_token=False):
+        with transaction.atomic():
+            if application is None:
+                application, created = Application.objects.get_or_create(
+                    client_id='public',
+                    client_type=Application.CLIENT_PUBLIC,
+                    authorization_grant_type=Application.GRANT_PASSWORD,
+                )
+                if created:
+                    ApplicationInfo.objects.create(application=application)
 
-    def latest(self):
+            if expires is None:
+                access_token_expires_seconds = getattr(settings, 'OAUTH2_PROVIDER', {}).get('ACCESS_TOKEN_EXPIRE_SECONDS', 86400)
+                expires = timezone.now() + datetime.timedelta(seconds=access_token_expires_seconds)
+
+            accesstoken = self.create(
+                application=application,
+                user=user,
+                expires=expires,
+                token=generate_token(),
+                scope=scope
+            )
+
+        return accesstoken
+
+    def get_from_entity_id(self, entity_id):
+        # lookup by a faked
+        padding = len(entity_id) % 4
+        if padding > 0:
+            entity_id = '{}{}'.format(entity_id, (4-padding)*'=')
+        decoded = base64.urlsafe_b64decode(entity_id.encode('utf-8'))
+        id = re.sub(r'^{}'.format(self.model.fake_entity_id_prefix), '', decoded)
         try:
-            return self.filter(is_active=True).order_by('-version')[0]
-        except IndexError:
+            pk = int(id)
+        except ValueError as e:
             pass
-
-    def cached_latest(self):
-        latest = cache.get(self.latest_version_key)
-        if latest is None:
-            return self.publish_latest()
-        return latest
-
-    def publish_latest(self):
-        latest = self.latest()
-        if latest is not None:
-            cache.set(self.latest_version_key, latest, timeout=None)
-        return latest
+        else:
+            try:
+                obj = self.get(pk=pk)
+            except self.model.DoesNotExist:
+                pass
+            else:
+                return obj
+        raise self.model.DoesNotExist
 
 
-class TermsVersion(IsActive, BaseAuditedModel, cachemodel.CacheModel):
-    version = models.PositiveIntegerField(unique=True)
-    short_description = models.TextField(blank=True)
-    cached = TermsVersionManager()
-
-    def publish(self):
-        super(TermsVersion, self).publish()
-        TermsVersion.cached.publish_latest()
-
-
-class TermsAgreement(BaseAuditedModelDeletedWithUser, cachemodel.CacheModel):
-    user = models.ForeignKey('badgeuser.BadgeUser',
-                             on_delete=models.CASCADE)
-    terms_version = models.PositiveIntegerField()
-    agreed = models.BooleanField(default=True)
+class BadgrAccessToken(AccessToken, cachemodel.CacheModel):
+    objects = BadgrAccessTokenManager()
+    fake_entity_id_prefix = "BadgrAccessToken.id="
 
     class Meta:
-        ordering = ('-terms_version',)
-        unique_together = ('user', 'terms_version')
+        proxy = True
+
+    @property
+    def entity_id(self):
+        # fake an entityId for this non-entity
+        digest = "{}{}".format(self.fake_entity_id_prefix, self.pk)
+        b64_string = base64.urlsafe_b64encode(digest)
+        b64_trimmed = re.sub(r'=+$', '', b64_string)
+        return b64_trimmed
+
+    def get_entity_class_name(self):
+        return 'AccessToken'
+
+    @property
+    def application_name(self):
+        return self.application.name
+
+    @property
+    def applicationinfo(self):
+        try:
+            return self.application.applicationinfo
+        except ApplicationInfo.DoesNotExist:
+            return ApplicationInfo()
+
+
+class TermsUrl(cachemodel.CacheModel):
+    terms = models.ForeignKey('badgeuser.Terms', on_delete=models.CASCADE, related_name='terms_urls')
+    url = models.URLField(max_length=200, null=True)
+    LANGUAGE_ENGLISH = 'en'
+    LANGUAGE_DUTCH = 'nl'
+    LANGUAGE_CHOICES = (
+        (LANGUAGE_ENGLISH, 'en'),
+        (LANGUAGE_DUTCH, 'nl')
+    )
+    language = models.CharField(max_length=255, choices=LANGUAGE_CHOICES, default=LANGUAGE_ENGLISH, blank=False, null=False)
+    excerpt = models.BooleanField(default=False)
+
+
+class Terms(BaseAuditedModel, BaseVersionedEntity, cachemodel.CacheModel):
+    version = models.PositiveIntegerField(default=1)
+    institution = models.ForeignKey('institution.Institution', on_delete=models.CASCADE, related_name='terms', null=True, blank=True)
+
+    TYPE_FORMAL_BADGE = 'formal_badge'
+    TYPE_INFORMAL_BADGE = 'informal_badge'
+    TYPE_SERVICE_AGREEMENT_STUDENT = 'service_agreement_student'
+    TYPE_SERVICE_AGREEMENT_EMPLOYEE = 'service_agreement_employee'
+    # TYPE_GENERAL_PRIVACY_STATEMENT = 'general_privacy_statement'
+    TYPE_TERMS_OF_SERVICE = 'terms_of_service'
+    TYPE_CHOICES = (
+        (TYPE_FORMAL_BADGE, 'formal_badge'),
+        (TYPE_INFORMAL_BADGE, 'informal_badge'),
+        # (TYPE_GENERAL_PRIVACY_STATEMENT, 'general_privacy_statement'),
+        (TYPE_SERVICE_AGREEMENT_STUDENT, 'service_agreement_student'),
+        (TYPE_SERVICE_AGREEMENT_EMPLOYEE, 'service_agreement_employee'),
+        (TYPE_TERMS_OF_SERVICE, 'terms_of_service')
+    )
+    terms_type = models.CharField(max_length=254, choices=TYPE_CHOICES, default=TYPE_TERMS_OF_SERVICE)
+
+    class Meta:
+        unique_together = ('institution', 'terms_type')
+
+    @classmethod
+    def get_general_terms(cls, user):
+        if user.is_student:
+            return list(Terms.objects.filter(terms_type__in=(Terms.TYPE_SERVICE_AGREEMENT_STUDENT,
+                                                             Terms.TYPE_TERMS_OF_SERVICE)))
+        elif user.is_teacher:
+            return list(Terms.objects.filter(terms_type__in=(Terms.TYPE_SERVICE_AGREEMENT_EMPLOYEE,
+                                                             Terms.TYPE_TERMS_OF_SERVICE)))
+        raise BadgrValidationError('Cannot get general terms user is neither teacher nor student', 0)
+
+    def has_been_accepted_by(self, user):
+        for agreement in user.cached_terms_agreements():
+            if agreement.terms == self:
+                return agreement.agreed and self.version == agreement.agreed_version
+        return False
+
+    def accept(self, user):
+        ''' make user accept terms
+            returns: TermsAgreement'''
+        # must work for updating increment and for accepting the first time
+        terms_agreement, created = TermsAgreement.objects.get_or_create(user=user, terms=self)
+        terms_agreement.agreed_version = self.version
+        terms_agreement.agreed = True
+        terms_agreement.save()
+        user.remove_cached_data(['cached_terms_agreements'])
+        return terms_agreement
+
+    def save(self, *args, **kwargs):
+        super(Terms, self).save()
+        if self.institution:
+            self.institution.remove_cached_data(['cached_terms'])
+
+
+class TermsAgreement(BaseAuditedModel, BaseVersionedEntity, cachemodel.CacheModel):
+    user = models.ForeignKey('badgeuser.BadgeUser', on_delete=models.CASCADE)
+    terms = models.ForeignKey('badgeuser.Terms', on_delete=models.CASCADE)
+    agreed = models.BooleanField(default=True)
+    agreed_version = models.PositiveIntegerField(null=True)

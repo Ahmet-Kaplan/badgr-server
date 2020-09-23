@@ -1,10 +1,16 @@
 from django.apps import apps
 from django.conf import settings
 from django.conf.urls import include, url
+from django.contrib.auth import views as auth_views
+from django.views.decorators.csrf import csrf_exempt
 from django.urls import path
 
+from ims.views import base
 from mainsite.admin import badgr_admin
+from mainsite.graphql_view import ExtendedGraphQLView
+from mainsite.views import serve_protected_document
 from backpack.badge_connect_api import BadgeConnectManifestView, BadgeConnectManifestRedirectView
+
 from mainsite.oauth2_api import AuthorizationApiView, TokenView, AuthCodeExchange, RegisterApiView
 
 badgr_admin.autodiscover()
@@ -17,11 +23,14 @@ def django2_include(three_tuple_urlconf):
 from django.views.generic.base import RedirectView, TemplateView
 from oauth2_provider.urls import base_urlpatterns as oauth2_provider_base_urlpatterns
 
-from mainsite.views import SitewideActionFormView, LoginAndObtainAuthToken, RedirectToUiLogin, DocsAuthorizeRedirect
+from mainsite.views import SitewideActionFormView, LoginAndObtainAuthToken, RedirectToUiLogin, DocsAuthorizeRedirect, \
+    TermsAndConditionsView, TermsAndConditionsResignView, AcceptTermsAndConditionsView
 from mainsite.views import info_view, email_unsubscribe, AppleAppSiteAssociation, error404, error500
 from pathway.api import PathwayList
 
 urlpatterns = [
+    path("graphql", csrf_exempt(ExtendedGraphQLView.as_view(graphiql=True))),
+
     # Backup URLs in case the server isn't serving these directly
     url(r'^favicon\.png[/]?$', RedirectView.as_view(url='%simages/favicon.png' % settings.STATIC_URL, permanent=True)),
     url(r'^favicon\.ico[/]?$', RedirectView.as_view(url='%simages/favicon.png' % settings.STATIC_URL, permanent=True)),
@@ -52,6 +61,7 @@ urlpatterns = [
     # Admin URLs
     url(r'^staff/sidewide-actions$', SitewideActionFormView.as_view(), name='badgr_admin_sitewide_actions'),
     url(r'^staff/', django2_include(badgr_admin.urls)),
+    url(r'^staff/superlogin', auth_views.LoginView.as_view(), name ='badgr_admin_super_login'),
 
     # Service health endpoint
     url(r'^health', include('health.urls')),
@@ -77,6 +87,7 @@ urlpatterns = [
     url(r'', include('backpack.share_urls')),
 
     # REST Framework
+    url(r'^account/', include('badgrsocialauth.redirect_urls')),
     url(r'^api-auth/token$', LoginAndObtainAuthToken.as_view()),
 
     # Social Auth (oAuth2 and SAML)
@@ -89,6 +100,30 @@ urlpatterns = [
     url(r'^v1/issuer/', include('issuer.v1_api_urls'), kwargs={'version': 'v1'}),
     url(r'^v1/earner/', include('backpack.v1_api_urls'), kwargs={'version': 'v1'}),
 
+    # include LTI endpoints
+    url(r'^lti_edu/', include('lti_edu.api_urls')),
+
+    # # include Institution endpoints
+    url(r'^institution/', include('institution.api_urls')),
+
+    url(r'^lti_issuer/', include('lti_edu.lti_urls')),
+
+
+    # include theming endpoints
+    url(r'v1/', include('theming.api_urls'), kwargs={'version': 'v1'}),
+
+    # Accept Terms View - TODO remove them as the client now renders them
+    url(r'^accept_terms/(?P<after_terms_agreement_url_name>[^/]+)/(?P<state>[^/]+)/(?P<id_token>[^/]+)', TermsAndConditionsView.as_view(), name='accept_terms'),
+    url(r'^accept_terms_resign/(?P<after_terms_agreement_url_name>[^/]+)/(?P<state>[^/]+)/(?P<id_token>[^/]+)', TermsAndConditionsResignView.as_view(), name='accept_terms_resign'),
+    url(r'^accept_terms_resign_accepted/(?P<after_terms_agreement_url_name>[^/]+)/(?P<state>[^/]+)/(?P<id_token>[^/]+)', AcceptTermsAndConditionsView.as_view(), name='accept_terms_resign_accepted'),
+
+    #  include signing endpoints
+    url(r'^signing/', include('signing.api_urls')),
+
+    # include staff endpoints
+    url(r'^staff-membership/', include('staff.api_urls')),
+
+]
 
     # NOTE: pathway and recipient were written and deployed for beta testing at /v2/ before /v2/ was formalized
     # they do not conform to new /v2/ conventions,  they need to appear before /v2/ to not collide
@@ -111,7 +146,22 @@ urlpatterns = [
     url(r'^v1/externaltools/', include('externaltools.v1_api_urls'), kwargs={'version': 'v1'}),
     url(r'^v2/externaltools/', include('externaltools.v2_api_urls'), kwargs={'version': 'v2'}),
 
+urlpatterns += [
+    url(
+        r'^lti_app/(?P<app_slug>[A-Za-z0-9\-]+)/config/(?P<tenant_slug>[A-Za-z0-9\-]+)\.xml$',
+        base.lti_config,
+        name='lti-config'
+    ),
+    url(r'^lti_app/(?P<slug>[A-Za-z0-9\-]+)/?$', base.lti_launch)
+]
 
+urlpatterns += [
+    url(
+        r'^lti_app/(?P<app_slug>[A-Za-z0-9\-]+)/config/(?P<tenant_slug>[A-Za-z0-9\-]+)\.xml$',
+        base.lti_config,
+        name='lti-config'
+    ),
+    url(r'^lti_app/(?P<slug>[A-Za-z0-9\-]+)/?$', base.lti_launch)
 ]
 
 # Test URLs to allow you to see these pages while DEBUG is True
@@ -158,6 +208,12 @@ if settings.DEBUG and apps.is_installed('debug_toolbar'):
         ]
     except ImportError:
         pass
+
+
+# protected assertion media files
+urlpatterns.insert(0,
+    url(r'^media/(?P<path>.*)$', serve_protected_document, {'document_root': settings.MEDIA_ROOT}, name='serve_protected_document'),
+)
 
 handler404 = error404
 handler500 = error500

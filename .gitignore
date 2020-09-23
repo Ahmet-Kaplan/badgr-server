@@ -1,5 +1,8 @@
 *.pyc
 *.egg
+settings_local.py
+settings_local.dev.py
+settings_local.prod.py
 .*.sw*
 *~
 .DS_Store
@@ -37,6 +40,7 @@ coverage.xml
 *.cover
 api_spec_v1.json
 api_spec_v2.json
+api_spec_bcv1.json
 api_docs_v1.json
 api_docs_v2.json
 test_data
@@ -47,3 +51,4 @@ test_data
 .settings
 
 
+django.log
